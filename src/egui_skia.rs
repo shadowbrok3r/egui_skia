@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use egui::{Context, Pos2};
-use skia_safe::{Canvas, Surface};
+use egui::{Context, Pos2, Rect};
+use skia_safe::{surfaces, Canvas, Surface};
 
 use crate::painter::Painter;
 
@@ -26,7 +26,7 @@ pub fn rasterize(
     ui: impl FnMut(&Context),
     options: Option<RasterizeOptions>,
 ) -> Surface {
-    let mut surface = Surface::new_raster_n32_premul(size).expect("Failed to create surface");
+    let mut surface = surfaces::raster_n32_premul(size).expect("Failed to create surface");
     draw_onto_surface(&mut surface, ui, options);
     surface
 }
@@ -41,16 +41,13 @@ pub fn draw_onto_surface(
         frames_before_screenshot,
     } = options.unwrap_or_default();
     let mut backend = EguiSkia::new();
+    backend.egui_ctx.set_pixels_per_point(pixels_per_point);
 
     let input = egui::RawInput {
-        screen_rect: Some(
-            [
-                Pos2::default(),
-                Pos2::new(surface.width() as f32, surface.height() as f32),
-            ]
-            .into(),
-        ),
-        pixels_per_point: Some(pixels_per_point),
+        screen_rect: Some(Rect::from_min_max(
+            Pos2::default(),
+            Pos2::new(surface.width() as f32, surface.height() as f32),
+        )),
         ..Default::default()
     };
 
@@ -67,6 +64,7 @@ pub struct EguiSkia {
 
     shapes: Vec<egui::epaint::ClippedShape>,
     textures_delta: egui::TexturesDelta,
+    pixels_per_point: f32,
 }
 
 impl EguiSkia {
@@ -77,10 +75,11 @@ impl EguiSkia {
             painter,
             shapes: Default::default(),
             textures_delta: Default::default(),
+            pixels_per_point: 1.0,
         }
     }
 
-    /// Returns a duration after witch egui should repaint.
+    /// Returns a duration after which egui should repaint.
     ///
     /// Call [`Self::paint`] later to paint.
     pub fn run(
@@ -88,27 +87,36 @@ impl EguiSkia {
         input: egui::RawInput,
         run_ui: impl FnMut(&Context),
     ) -> (Duration, egui::PlatformOutput) {
+        #[allow(deprecated)]
         let egui::FullOutput {
             platform_output,
             textures_delta,
             shapes,
-            repaint_after,
+            pixels_per_point,
+            viewport_output,
         } = self.egui_ctx.run(input, run_ui);
 
         self.shapes = shapes;
+        self.pixels_per_point = pixels_per_point;
         self.textures_delta.append(textures_delta);
+
+        let repaint_after = viewport_output
+            .values()
+            .map(|v| v.repaint_delay)
+            .min()
+            .unwrap_or(Duration::ZERO);
 
         (repaint_after, platform_output)
     }
 
     /// Paint the results of the last call to [`Self::run`].
-    pub fn paint(&mut self, canvas: &mut Canvas) {
+    pub fn paint(&mut self, canvas: &Canvas) {
         let shapes = std::mem::take(&mut self.shapes);
         let textures_delta = std::mem::take(&mut self.textures_delta);
-        let clipped_primitives = self.egui_ctx.tessellate(shapes);
+        let clipped_primitives = self.egui_ctx.tessellate(shapes, self.pixels_per_point);
         self.painter.paint_and_update_textures(
             canvas,
-            self.egui_ctx.pixels_per_point(),
+            self.pixels_per_point,
             clipped_primitives,
             textures_delta,
         );

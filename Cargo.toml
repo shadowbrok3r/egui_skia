@@ -1,7 +1,7 @@
 [package]
 name = "egui_skia"
-version = "0.4.0"
-edition = "2021"
+version = "0.5.0"
+edition = "2024"
 description = "egui_skia is a skia integration for the egui ui library. Render egui within a skia application or render skia in a egui application."
 license = "MIT"
 homepage = "https://github.com/lucasmerlin/egui_skia"
@@ -12,11 +12,11 @@ categories = ["gui"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-winit = ["dep:egui-winit"]
+winit = ["dep:egui-winit", "dep:raw-window-handle"]
 cpu_fix = []
 
 gl = ["skia-safe/gl"]
-vulkan = ["skia-safe/vulkan", "skulpin"]
+vulkan = ["skia-safe/vulkan"]
 
 metal = ["skia-safe/metal"]
 
@@ -25,24 +25,12 @@ opt-level = 3
 
 [dependencies]
 
-egui = ">=0.20"
-skia-safe = { version = ">= 0.53", features = [] }
-egui-winit = { version = ">=0.20", optional = true, default-features = false }
-
-skulpin = { version = ">=0.14.1", features = [], optional = true}
+egui = "0.34"
+skia-safe = { version = "0.99", features = [] }
+egui-winit = { version = "0.34", optional = true, default-features = false }
+raw-window-handle = { version = "0.6", optional = true }
 
 [dev-dependencies]
-softbuffer = { git = "https://github.com/john01dav/softbuffer" }
-egui_demo_lib = ">=0.20"
-raw-window-handle = "0.5"
-foreign-types-shared = "0.1.1"
-
-sdl2 = { version = "0.35.2", features = ["raw-window-handle"] }
-gl = "0.14.0"
-egui-sdl2-event = { version = "0.4.0", package = "egui-skia-sdl2-event" }
-
-[target.'cfg(target_os = "macos")'.dev-dependencies]
-metal = "0.24"
-cocoa = "0.24"
-core-graphics-types = "0.1"
-objc = "0.2"
+softbuffer = "0.4"
+raw-window-handle = "0.6"
+winit = { version = "0.30", features = ["rwh_06"] }

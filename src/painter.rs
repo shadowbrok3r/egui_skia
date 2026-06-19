@@ -1,15 +1,15 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use egui::epaint::ahash::AHashMap;
+use egui::ahash::HashMap;
 #[cfg(feature = "cpu_fix")]
 use egui::epaint::Mesh16;
 use egui::epaint::Primitive;
 use egui::{ClippedPrimitive, ImageData, Pos2, TextureId, TexturesDelta};
 use skia_safe::vertices::VertexMode;
 use skia_safe::{
-    scalar, BlendMode, Canvas, ClipOp, Color, ConditionallySend, Data, Drawable, Image, ImageInfo,
-    Paint, PictureRecorder, Point, Rect, Sendable, Surface, Vertices,
+    images, scalar, surfaces, BlendMode, Canvas, ClipOp, Color, ConditionallySend, Data, Drawable,
+    Image, ImageInfo, Paint, PictureRecorder, Point, Rect, Sendable, Vertices,
 };
 
 #[derive(Eq, PartialEq)]
@@ -25,7 +25,7 @@ struct PaintHandle {
 }
 
 pub struct Painter {
-    paints: AHashMap<TextureId, PaintHandle>,
+    paints: HashMap<TextureId, PaintHandle>,
     white_paint_workaround: Paint,
 }
 
@@ -35,66 +35,49 @@ impl Painter {
         white_paint_workaround.set_color(Color::WHITE);
 
         Self {
-            paints: AHashMap::new(),
+            paints: HashMap::default(),
             white_paint_workaround,
         }
     }
 
     pub fn paint_and_update_textures(
         &mut self,
-        canvas: &mut Canvas,
+        canvas: &Canvas,
         dpi: f32,
         primitives: Vec<ClippedPrimitive>,
         textures_delta: TexturesDelta,
     ) {
         textures_delta.set.iter().for_each(|(id, image_delta)| {
-            let delta_image = match &image_delta.image {
-                ImageData::Color(color_image) => Image::from_raster_data(
-                    &ImageInfo::new_n32_premul(
-                        skia_safe::ISize::new(
-                            color_image.width() as i32,
-                            color_image.height() as i32,
-                        ),
-                        None,
+            let ImageData::Color(color_image) = &image_delta.image;
+
+            let delta_image = images::raster_from_data(
+                &ImageInfo::new_n32_premul(
+                    skia_safe::ISize::new(
+                        color_image.width() as i32,
+                        color_image.height() as i32,
                     ),
-                    Data::new_copy(
-                        color_image
-                            .pixels
-                            .iter()
-                            .flat_map(|p| p.to_array())
-                            .collect::<Vec<_>>()
-                            .as_slice(),
-                    ),
-                    color_image.width() * 4,
-                )
-                .unwrap(),
-                ImageData::Font(font) => {
-                    let pixels = font.srgba_pixels(Some(1.0));
-                    Image::from_raster_data(
-                        &ImageInfo::new_n32_premul(
-                            skia_safe::ISize::new(font.width() as i32, font.height() as i32),
-                            None,
-                        ),
-                        Data::new_copy(
-                            pixels
-                                .flat_map(|p| p.to_array())
-                                .collect::<Vec<_>>()
-                                .as_slice(),
-                        ),
-                        font.width() * 4,
-                    )
-                    .unwrap()
-                }
-            };
+                    None,
+                ),
+                Data::new_copy(
+                    color_image
+                        .pixels
+                        .iter()
+                        .flat_map(|p| p.to_array())
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                ),
+                color_image.width() * 4,
+            )
+            .unwrap();
 
             let image = match image_delta.pos {
                 None => delta_image,
                 Some(pos) => {
                     let old_image = self.paints.remove(id).unwrap().image;
 
-                    let mut surface = Surface::new_raster_n32_premul(skia_safe::ISize::new(
-                        old_image.width() as i32,
-                        old_image.height() as i32,
+                    let mut surface = surfaces::raster_n32_premul(skia_safe::ISize::new(
+                        old_image.width(),
+                        old_image.height(),
                     ))
                     .unwrap();
 
@@ -118,6 +101,13 @@ impl Painter {
 
                     surface.image_snapshot()
                 }
+            };
+
+            // TextureId::Managed(0) is the font atlas; everything else is a user/image texture.
+            let paint_type = if *id == TextureId::default() {
+                PaintType::Font
+            } else {
+                PaintType::Image
             };
 
             let local_matrix =
@@ -148,8 +138,6 @@ impl Painter {
                 .to_shader((tile_mode, tile_mode), sampling_options, &local_matrix)
                 .unwrap();
 
-            image.width();
-
             let mut paint = Paint::default();
             paint.set_shader(font_shader);
             paint.set_color(Color::WHITE);
@@ -159,10 +147,7 @@ impl Painter {
                 PaintHandle {
                     paint,
                     image,
-                    paint_type: match image_delta.image {
-                        ImageData::Color(_) => PaintType::Image,
-                        ImageData::Font(_) => PaintType::Font,
-                    },
+                    paint_type,
                 },
             );
         });
@@ -176,8 +161,8 @@ impl Painter {
             );
             match primitive.primitive {
                 Primitive::Mesh(mesh) => {
-                    canvas.set_matrix(skia_safe::M44::new_identity().set_scale(dpi, dpi, 1.0));
-                    let mut arc = skia_safe::AutoCanvasRestore::guard(canvas, true);
+                    canvas.set_matrix(&skia_safe::M44::new_identity().set_scale(dpi, dpi, 1.0));
+                    let arc = skia_safe::AutoCanvasRestore::guard(canvas, true);
 
                     #[cfg(feature = "cpu_fix")]
                     let meshes = mesh
@@ -195,9 +180,8 @@ impl Painter {
                         let mut texs = Vec::with_capacity(mesh.vertices.len());
                         let mut colors = Vec::with_capacity(mesh.vertices.len());
 
-                        mesh.vertices.iter().enumerate().for_each(|(_i, v)| {
-                            // Apparently vertices can be NaN and if they are NaN, nothing is rendered.
-                            // Replacing them with 0 works around this.
+                        mesh.vertices.iter().for_each(|v| {
+                            // Vertices can be NaN; replacing them with 0 avoids dropped meshes.
                             // https://github.com/lucasmerlin/egui_skia/issues/4
                             let fixed_pos = if v.pos.x.is_nan() || v.pos.y.is_nan() {
                                 Pos2::new(0.0, 0.0)
@@ -210,14 +194,14 @@ impl Painter {
 
                             let c = v.color;
                             let c = Color::from_argb(c.a(), c.r(), c.g(), c.b());
-                            // Un-premultply color
-                            // This fixes some cases of the color-test
+                            // Un-premultiply color so the Modulate blend produces the right result.
                             // https://github.com/lucasmerlin/egui_skia/issues/6
-                            // there might be a better solution though?
                             let mut cf = skia_safe::Color4f::from(c);
-                            cf.r /= cf.a;
-                            cf.g /= cf.a;
-                            cf.b /= cf.a;
+                            if cf.a > 0.0 {
+                                cf.r /= cf.a;
+                                cf.g /= cf.a;
+                                cf.b /= cf.a;
+                            }
                             colors.push(Color::from_argb(
                                 c.a(),
                                 (cf.r * 255.0) as u8,
@@ -226,51 +210,21 @@ impl Painter {
                             ));
                         });
 
-                        // TODO: Use vertex builder
-                        // let mut vertex_builder = Builder::new(
-                        //     VertexMode::Triangles,
-                        //     mesh.vertices.len(),
-                        //     mesh.indices.len(),
-                        //     BuilderFlags::HAS_COLORS | BuilderFlags::HAS_TEX_COORDS,
-                        // );
-                        //
-                        // for (i, v) in mesh.vertices.iter().enumerate() {
-                        //     vertex_builder.positions()[i] = Point::new(v.pos.x, v.pos.y);
-                        //     vertex_builder.tex_coords().unwrap()[i] = Point::new(v.uv.x, v.uv.y);
-                        //     vertex_builder.colors().unwrap()[i] = Color::from_argb(
-                        //         v.color.a(),
-                        //         v.color.r(),
-                        //         v.color.g(),
-                        //         v.color.b(),
-                        //     );
-                        // }
-                        // let vertices = vertex_builder.detach();
-
                         let vertices = Vertices::new_copy(
                             VertexMode::Triangles,
                             &pos,
                             &texs,
                             &colors,
-                            Some(
-                                mesh.indices
-                                    .iter()
-                                    .map(|index| *index as u16)
-                                    .collect::<Vec<u16>>()
-                                    .as_slice(),
-                            ),
+                            Some(mesh.indices.as_slice()),
                         );
 
                         arc.clip_rect(skclip_rect, ClipOp::default(), true);
 
-                        // Egui use the uv coordinates 0,0 to get a white color when drawing vector graphics
-                        // 0,0 is always a white dot on the font texture
-                        // Unfortunately skia has a bug where it cannot get a color when the uv coordinates are equal
+                        // egui uses uv 0,0 to fetch a white texel for solid-color shapes.
+                        // Skia cannot fetch a color when all uv coordinates are equal, so
+                        // split_texture_meshes isolates 0,0-only sub-meshes and we paint them
+                        // with a solid white paint instead of the texture shader.
                         // https://bugs.chromium.org/p/skia/issues/detail?id=13706
-                        // As a workaround, split_texture_meshes splits meshes that contain both 0,0 vertices, as
-                        // well as non-0,0 vertices into multiple meshes.
-                        // Here we check if the mesh is a font texture and if it's first uv has 0,0
-                        // If yes, we use a white paint instead of the texture shader paint
-
                         let cpu_fix = if cfg!(feature = "cpu_fix")
                             && self.paints.get(&mesh.texture_id).unwrap().paint_type
                                 == PaintType::Font
@@ -303,14 +257,15 @@ impl Painter {
                         rect.max.y * dpi,
                     );
 
-                    let mut drawable: Drawable = callback.callback.deref()(skia_rect).0.unwrap();
+                    let mut drawable: Drawable =
+                        callback.callback.deref()(skia_rect).0.into_inner();
 
-                    let mut arc = skia_safe::AutoCanvasRestore::guard(canvas, true);
+                    let arc = skia_safe::AutoCanvasRestore::guard(canvas, true);
 
                     arc.clip_rect(skclip_rect, ClipOp::default(), true);
                     arc.translate((rect.min.x, rect.min.y));
 
-                    drawable.draw(&mut arc, None);
+                    drawable.draw(&arc, None);
                 }
             }
         }
@@ -320,7 +275,6 @@ impl Painter {
         });
     }
 
-    // This could be optimized more but works for now
     #[cfg(feature = "cpu_fix")]
     fn split_texture_meshes(&self, mesh: Mesh16) -> Vec<Mesh16> {
         if self.paints.get(&mesh.texture_id).unwrap().paint_type != PaintType::Font {
@@ -351,7 +305,7 @@ impl Painter {
                 is_zero = Some(is_current_zero)
             }
             let last = meshes.last_mut().unwrap();
-            last.vertices.push(vertex.clone());
+            last.vertices.push(*vertex);
             last.indices.push(last.indices.len() as u16);
         }
 
@@ -370,11 +324,11 @@ pub struct EguiSkiaPaintCallback {
 }
 
 impl EguiSkiaPaintCallback {
-    pub fn new<F: Fn(&mut Canvas) + Send + Sync + 'static>(callback: F) -> EguiSkiaPaintCallback {
+    pub fn new<F: Fn(&Canvas) + Send + Sync + 'static>(callback: F) -> EguiSkiaPaintCallback {
         EguiSkiaPaintCallback {
             callback: Box::new(move |rect| {
                 let mut pr = PictureRecorder::new();
-                let canvas = pr.begin_recording(rect, None);
+                let canvas = pr.begin_recording(rect, false);
                 callback(canvas);
                 SyncSendableDrawable(
                     pr.finish_recording_as_drawable()
