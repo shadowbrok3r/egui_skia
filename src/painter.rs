@@ -1,7 +1,7 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
-use egui::ahash::HashMap;
+use std::collections::HashMap;
 #[cfg(feature = "cpu_fix")]
 use egui::epaint::Mesh16;
 use egui::epaint::Primitive;

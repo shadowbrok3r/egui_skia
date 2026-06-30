@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use egui::{Context, Pos2, Rect};
+use egui::{Context, Pos2, Rect, Ui};
 use skia_safe::{surfaces, Canvas, Surface};
 
 use crate::painter::Painter;
@@ -23,7 +23,7 @@ impl Default for RasterizeOptions {
 
 pub fn rasterize(
     size: (i32, i32),
-    ui: impl FnMut(&Context),
+    ui: impl FnMut(&mut Ui),
     options: Option<RasterizeOptions>,
 ) -> Surface {
     let mut surface = surfaces::raster_n32_premul(size).expect("Failed to create surface");
@@ -33,7 +33,7 @@ pub fn rasterize(
 
 pub fn draw_onto_surface(
     surface: &mut Surface,
-    mut ui: impl FnMut(&Context),
+    mut ui: impl FnMut(&mut Ui),
     options: Option<RasterizeOptions>,
 ) {
     let RasterizeOptions {
@@ -85,7 +85,7 @@ impl EguiSkia {
     pub fn run(
         &mut self,
         input: egui::RawInput,
-        run_ui: impl FnMut(&Context),
+        run_ui: impl FnMut(&mut Ui),
     ) -> (Duration, egui::PlatformOutput) {
         #[allow(deprecated)]
         let egui::FullOutput {
@@ -94,7 +94,7 @@ impl EguiSkia {
             shapes,
             pixels_per_point,
             viewport_output,
-        } = self.egui_ctx.run(input, run_ui);
+        } = self.egui_ctx.run_ui(input, run_ui);
 
         self.shapes = shapes;
         self.pixels_per_point = pixels_per_point;

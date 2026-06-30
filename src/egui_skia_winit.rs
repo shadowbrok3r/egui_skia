@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use egui::{Context, ViewportId};
+use egui::{Ui, ViewportId};
 pub use egui_winit;
 use egui_winit::winit::event::WindowEvent;
 use egui_winit::winit::window::Window;
@@ -49,7 +49,7 @@ impl EguiSkiaWinit {
     /// Returns a duration after which egui should repaint.
     ///
     /// Call [`Self::paint`] later to paint.
-    pub fn run(&mut self, window: &Window, run_ui: impl FnMut(&Context)) -> Duration {
+    pub fn run(&mut self, window: &Window, run_ui: impl FnMut(&mut Ui)) -> Duration {
         let raw_input = self.egui_winit.take_egui_input(window);
 
         let (repaint_after, platform_output) = self.egui_skia.run(raw_input, run_ui);
