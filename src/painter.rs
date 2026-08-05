@@ -45,9 +45,15 @@ impl Painter {
         canvas: &Canvas,
         dpi: f32,
         primitives: Vec<ClippedPrimitive>,
-        textures_delta: TexturesDelta,
+        mut textures_delta: TexturesDelta,
     ) {
-        textures_delta.set.iter().for_each(|(id, image_delta)| {
+        // Flatten the per-texture delta lists, keeping each texture's deltas in order.
+        let queued = textures_delta
+            .set
+            .iter()
+            .flat_map(|(id, deltas)| deltas.iter().map(move |delta| (id, delta)));
+
+        queued.for_each(|(id, image_delta)| {
             let ImageData::Color(color_image) = &image_delta.image;
 
             let delta_image = images::raster_from_data(
@@ -273,6 +279,9 @@ impl Painter {
         textures_delta.free.iter().for_each(|id| {
             self.paints.remove(id);
         });
+
+        // TexturesDelta debug-asserts it is empty when dropped.
+        textures_delta.clear();
     }
 
     #[cfg(feature = "cpu_fix")]
