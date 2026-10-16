@@ -1,7 +1,5 @@
-use std::ops::Deref;
-use std::sync::Arc;
-
 use std::collections::HashMap;
+
 #[cfg(feature = "cpu_fix")]
 use egui::epaint::Mesh16;
 use egui::epaint::Primitive;
@@ -11,6 +9,18 @@ use skia_safe::{
     images, scalar, surfaces, BlendMode, Canvas, ClipOp, Color, ConditionallySend, Data, Drawable,
     Image, ImageInfo, Paint, PictureRecorder, Point, Rect, Sendable, Vertices,
 };
+
+/// Logs at warn level the first time a call site runs, and at debug level after that.
+macro_rules! warn_once {
+    ($($arg:tt)+) => {{
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::debug!($($arg)+);
+        } else {
+            log::warn!($($arg)+);
+        }
+    }};
+}
 
 #[derive(Eq, PartialEq)]
 enum PaintType {
@@ -56,7 +66,7 @@ impl Painter {
         queued.for_each(|(id, image_delta)| {
             let ImageData::Color(color_image) = &image_delta.image;
 
-            let delta_image = images::raster_from_data(
+            let Some(delta_image) = images::raster_from_data(
                 &ImageInfo::new_n32_premul(
                     skia_safe::ISize::new(
                         color_image.width() as i32,
@@ -73,19 +83,37 @@ impl Painter {
                         .as_slice(),
                 ),
                 color_image.width() * 4,
-            )
-            .unwrap();
+            ) else {
+                warn_once!(
+                    "egui_skia: skipping {:?} update; no {}x{} image",
+                    id,
+                    color_image.width(),
+                    color_image.height()
+                );
+                return;
+            };
 
             let image = match image_delta.pos {
                 None => delta_image,
                 Some(pos) => {
-                    let old_image = self.paints.remove(id).unwrap().image;
+                    let Some(old_image) = self.paints.get(id).map(|handle| handle.image.clone())
+                    else {
+                        warn_once!("egui_skia: skipping partial update of unknown texture {id:?}");
+                        return;
+                    };
 
-                    let mut surface = surfaces::raster_n32_premul(skia_safe::ISize::new(
+                    let Some(mut surface) = surfaces::raster_n32_premul(skia_safe::ISize::new(
                         old_image.width(),
                         old_image.height(),
-                    ))
-                    .unwrap();
+                    )) else {
+                        warn_once!(
+                            "egui_skia: skipping partial update of {:?}; no {}x{} surface",
+                            id,
+                            old_image.width(),
+                            old_image.height()
+                        );
+                        return;
+                    };
 
                     let canvas = surface.canvas();
 
@@ -140,9 +168,12 @@ impl Painter {
             };
             let tile_mode = skia_safe::TileMode::Clamp;
 
-            let font_shader = image
-                .to_shader((tile_mode, tile_mode), sampling_options, &local_matrix)
-                .unwrap();
+            let Some(font_shader) =
+                image.to_shader((tile_mode, tile_mode), sampling_options, &local_matrix)
+            else {
+                warn_once!("egui_skia: skipping {id:?} update; no shader for its image");
+                return;
+            };
 
             let mut paint = Paint::default();
             paint.set_shader(font_shader);
@@ -166,7 +197,25 @@ impl Painter {
                 primitive.clip_rect.max.y,
             );
             match primitive.primitive {
-                Primitive::Mesh(mesh) => {
+                Primitive::Mesh(mut mesh) => {
+                    // Drops a trailing partial triangle.
+                    mesh.indices.truncate(mesh.indices.len() / 3 * 3);
+                    if mesh.indices.is_empty() || !mesh.is_valid() {
+                        warn_once!(
+                            "egui_skia: skipping mesh with no or out-of-range indices ({} vertices, {} indices)",
+                            mesh.vertices.len(),
+                            mesh.indices.len()
+                        );
+                        continue;
+                    }
+                    let Some(handle) = self.paints.get(&mesh.texture_id) else {
+                        warn_once!(
+                            "egui_skia: skipping mesh with unknown texture {:?}",
+                            mesh.texture_id
+                        );
+                        continue;
+                    };
+
                     canvas.set_matrix(&skia_safe::M44::new_identity().set_scale(dpi, dpi, 1.0));
                     let arc = skia_safe::AutoCanvasRestore::guard(canvas, true);
 
@@ -180,8 +229,6 @@ impl Painter {
                     let meshes = mesh.split_to_u16();
 
                     for mesh in &meshes {
-                        let texture_id = mesh.texture_id;
-
                         let mut pos = Vec::with_capacity(mesh.vertices.len());
                         let mut texs = Vec::with_capacity(mesh.vertices.len());
                         let mut colors = Vec::with_capacity(mesh.vertices.len());
@@ -231,29 +278,29 @@ impl Painter {
                         // split_texture_meshes isolates 0,0-only sub-meshes and we paint them
                         // with a solid white paint instead of the texture shader.
                         // https://bugs.chromium.org/p/skia/issues/detail?id=13706
-                        let cpu_fix = if cfg!(feature = "cpu_fix")
-                            && self.paints.get(&mesh.texture_id).unwrap().paint_type
-                                == PaintType::Font
-                        {
-                            !texs
+                        let cpu_fix = cfg!(feature = "cpu_fix")
+                            && handle.paint_type == PaintType::Font
+                            && texs
                                 .first()
-                                .map(|point| point.x != 0.0 || point.y != 0.0)
-                                .unwrap()
-                        } else {
-                            false
-                        };
+                                .is_some_and(|point| point.x == 0.0 && point.y == 0.0);
 
                         let paint = if cpu_fix {
                             &self.white_paint_workaround
                         } else {
-                            &self.paints[&texture_id].paint
+                            &handle.paint
                         };
 
                         arc.draw_vertices(&vertices, BlendMode::Modulate, paint);
                     }
                 }
                 Primitive::Callback(data) => {
-                    let callback: Arc<EguiSkiaPaintCallback> = data.callback.downcast().unwrap();
+                    let Some(callback) = data.callback.downcast_ref::<EguiSkiaPaintCallback>()
+                    else {
+                        warn_once!(
+                            "egui_skia: skipping paint callback that is not an EguiSkiaPaintCallback"
+                        );
+                        continue;
+                    };
                     let rect = data.rect;
 
                     let skia_rect = Rect::new(
@@ -263,8 +310,7 @@ impl Painter {
                         rect.max.y * dpi,
                     );
 
-                    let mut drawable: Drawable =
-                        callback.callback.deref()(skia_rect).0.into_inner();
+                    let mut drawable: Drawable = (callback.callback)(skia_rect).0.into_inner();
 
                     let arc = skia_safe::AutoCanvasRestore::guard(canvas, true);
 
@@ -286,7 +332,11 @@ impl Painter {
 
     #[cfg(feature = "cpu_fix")]
     fn split_texture_meshes(&self, mesh: Mesh16) -> Vec<Mesh16> {
-        if self.paints.get(&mesh.texture_id).unwrap().paint_type != PaintType::Font {
+        if self
+            .paints
+            .get(&mesh.texture_id)
+            .is_none_or(|handle| handle.paint_type != PaintType::Font)
+        {
             return vec![mesh];
         }
 
@@ -300,7 +350,9 @@ impl Painter {
         });
 
         for index in mesh.indices.iter() {
-            let vertex = mesh.vertices.get(*index as usize).unwrap();
+            let Some(vertex) = mesh.vertices.get(*index as usize) else {
+                continue;
+            };
             let is_current_zero = vertex.uv.x == 0.0 && vertex.uv.y == 0.0;
             if is_current_zero != is_zero.unwrap_or(is_current_zero) {
                 meshes.push(Mesh16 {
