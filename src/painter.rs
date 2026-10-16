@@ -6,8 +6,9 @@ use egui::epaint::Primitive;
 use egui::{ClippedPrimitive, ImageData, Pos2, TextureId, TexturesDelta};
 use skia_safe::vertices::VertexMode;
 use skia_safe::{
-    images, scalar, surfaces, BlendMode, Canvas, ClipOp, Color, ConditionallySend, Data, Drawable,
-    Image, ImageInfo, Paint, PictureRecorder, Point, Rect, Sendable, Vertices,
+    AlphaType, BlendMode, Canvas, ClipOp, Color, ColorType, ConditionallySend, Data, Drawable,
+    Image, ImageInfo, Paint, PictureRecorder, Point, Rect, Sendable, Vertices, images, scalar,
+    surfaces,
 };
 
 /// Logs at warn level the first time a call site runs, and at debug level after that.
@@ -67,11 +68,10 @@ impl Painter {
             let ImageData::Color(color_image) = &image_delta.image;
 
             let Some(delta_image) = images::raster_from_data(
-                &ImageInfo::new_n32_premul(
-                    skia_safe::ISize::new(
-                        color_image.width() as i32,
-                        color_image.height() as i32,
-                    ),
+                &ImageInfo::new(
+                    (color_image.width() as i32, color_image.height() as i32),
+                    ColorType::RGBA8888,
+                    AlphaType::Premul,
                     None,
                 ),
                 Data::new_copy(
@@ -280,9 +280,7 @@ impl Painter {
                         // https://bugs.chromium.org/p/skia/issues/detail?id=13706
                         let cpu_fix = cfg!(feature = "cpu_fix")
                             && handle.paint_type == PaintType::Font
-                            && texs
-                                .first()
-                                .is_some_and(|point| point.x == 0.0 && point.y == 0.0);
+                            && texs.iter().all(|point| point.x == 0.0 && point.y == 0.0);
 
                         let paint = if cpu_fix {
                             &self.white_paint_workaround
@@ -340,34 +338,37 @@ impl Painter {
             return vec![mesh];
         }
 
-        let mut is_zero = None;
+        // Most vertices a sub-mesh can hold while its indices fit in a u16.
+        const MAX_VERTICES: usize = u16::MAX as usize + 1;
 
-        let mut meshes = Vec::new();
-        meshes.push(Mesh16 {
-            indices: vec![],
-            vertices: vec![],
-            texture_id: mesh.texture_id,
-        });
-
-        for index in mesh.indices.iter() {
-            let Some(vertex) = mesh.vertices.get(*index as usize) else {
+        let mut meshes: Vec<Mesh16> = Vec::new();
+        let mut run_is_zero = None;
+        for triangle in mesh.indices.chunks_exact(3) {
+            let (Some(a), Some(b), Some(c)) = (
+                mesh.vertices.get(triangle[0] as usize),
+                mesh.vertices.get(triangle[1] as usize),
+                mesh.vertices.get(triangle[2] as usize),
+            ) else {
                 continue;
             };
-            let is_current_zero = vertex.uv.x == 0.0 && vertex.uv.y == 0.0;
-            if is_current_zero != is_zero.unwrap_or(is_current_zero) {
+            let is_zero = [a, b, c].into_iter().all(|vertex| vertex.uv == Pos2::ZERO);
+            let full = meshes
+                .last()
+                .is_none_or(|last| last.vertices.len() + 3 > MAX_VERTICES);
+            if full || run_is_zero != Some(is_zero) {
                 meshes.push(Mesh16 {
                     indices: vec![],
                     vertices: vec![],
                     texture_id: mesh.texture_id,
                 });
-                is_zero = Some(is_current_zero)
+                run_is_zero = Some(is_zero);
             }
-            if is_zero.is_none() {
-                is_zero = Some(is_current_zero)
+            if let Some(last) = meshes.last_mut() {
+                for vertex in [a, b, c] {
+                    last.indices.push(last.vertices.len() as u16);
+                    last.vertices.push(*vertex);
+                }
             }
-            let last = meshes.last_mut().unwrap();
-            last.vertices.push(*vertex);
-            last.indices.push(last.indices.len() as u16);
         }
 
         meshes
@@ -405,3 +406,169 @@ impl EguiSkiaPaintCallback {
 struct SyncSendableDrawable(pub Sendable<Drawable>);
 
 unsafe impl Sync for SyncSendableDrawable {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use egui::epaint::{ImageDelta, Mesh, PaintCallback, Vertex};
+    use egui::{Color32, ColorImage, TextureOptions, pos2};
+
+    use super::*;
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> egui::Rect {
+        egui::Rect::from_min_max(pos2(x0, y0), pos2(x1, y1))
+    }
+
+    /// Paints onto a transparent surface and returns its pixels as RGBA bytes.
+    fn paint(
+        width: i32,
+        height: i32,
+        primitives: Vec<Primitive>,
+        textures_delta: TexturesDelta,
+    ) -> Vec<u8> {
+        let mut surface = surfaces::raster_n32_premul((width, height)).expect("raster surface");
+        let clip_rect = rect(0.0, 0.0, width as f32, height as f32);
+        let primitives = primitives
+            .into_iter()
+            .map(|primitive| ClippedPrimitive {
+                clip_rect,
+                primitive,
+            })
+            .collect();
+        Painter::new().paint_and_update_textures(surface.canvas(), 1.0, primitives, textures_delta);
+
+        let info = ImageInfo::new(
+            (width, height),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let mut rgba = vec![0; (width * height * 4) as usize];
+        assert!(surface.read_pixels(&info, &mut rgba, width as usize * 4, (0, 0)));
+        rgba
+    }
+
+    #[test]
+    fn textures_keep_their_channel_order() {
+        let id = TextureId::User(1);
+        let texels = vec![Color32::RED, Color32::GREEN, Color32::BLUE];
+        let mut delta = TexturesDelta::default();
+        delta.push(
+            id,
+            ImageDelta::full(ColorImage::new([3, 1], texels), TextureOptions::NEAREST),
+        );
+        let mut mesh = Mesh::with_texture(id);
+        mesh.add_rect_with_uv(
+            rect(0.0, 0.0, 3.0, 1.0),
+            rect(0.0, 0.0, 1.0, 1.0),
+            Color32::WHITE,
+        );
+
+        let rgba = paint(3, 1, vec![Primitive::Mesh(mesh)], delta);
+        let pixels: Vec<&[u8]> = rgba.chunks_exact(4).collect();
+        for (i, expected) in [[255, 0, 0], [0, 255, 0], [0, 0, 255]].iter().enumerate() {
+            let close = pixels[i][..3]
+                .iter()
+                .zip(expected)
+                .all(|(&got, &want)| got.abs_diff(want) < 8);
+            assert!(close, "pixel {i} is {:?}, expected {expected:?}", pixels[i]);
+        }
+    }
+
+    #[cfg(feature = "cpu_fix")]
+    #[test]
+    fn font_meshes_past_u16_indices_draw_every_quad() {
+        // 12,000 one-pixel quads: 48,000 vertices and 72,000 indices in one mesh.
+        let (width, height) = (120, 100);
+        let mut delta = TexturesDelta::default();
+        delta.push(
+            TextureId::default(),
+            ImageDelta::full(
+                ColorImage::filled([2, 2], Color32::WHITE),
+                TextureOptions::NEAREST,
+            ),
+        );
+        let mut mesh = Mesh::with_texture(TextureId::default());
+        for y in 0..height {
+            for x in 0..width {
+                let (x, y) = (x as f32, y as f32);
+                mesh.add_rect_with_uv(
+                    rect(x, y, x + 1.0, y + 1.0),
+                    rect(0.5, 0.5, 1.0, 1.0),
+                    Color32::RED,
+                );
+            }
+        }
+
+        let rgba = paint(width, height, vec![Primitive::Mesh(mesh)], delta);
+        let unpainted = rgba.chunks_exact(4).filter(|px| px[3] != 255).count();
+        assert_eq!(
+            unpainted,
+            0,
+            "{unpainted} of {} pixels unpainted",
+            width * height
+        );
+    }
+
+    #[test]
+    fn unusable_items_are_skipped() {
+        let mut delta = TexturesDelta::default();
+        delta.push(
+            TextureId::default(),
+            ImageDelta::full(
+                ColorImage::filled([2, 2], Color32::WHITE),
+                TextureOptions::NEAREST,
+            ),
+        );
+        delta.push(
+            TextureId::User(2),
+            ImageDelta::full(ColorImage::new([0, 0], vec![]), TextureOptions::NEAREST),
+        );
+        delta.push(
+            TextureId::User(3),
+            ImageDelta::partial(
+                [0, 0],
+                ColorImage::filled([1, 1], Color32::RED),
+                TextureOptions::NEAREST,
+            ),
+        );
+
+        let mut unknown_texture = Mesh::with_texture(TextureId::User(9));
+        unknown_texture.add_rect_with_uv(
+            rect(0.0, 0.0, 4.0, 4.0),
+            rect(0.0, 0.0, 1.0, 1.0),
+            Color32::WHITE,
+        );
+
+        let vertex = Vertex {
+            pos: pos2(1.0, 1.0),
+            uv: pos2(0.0, 0.0),
+            color: Color32::WHITE,
+        };
+        let mut no_indices = Mesh::with_texture(TextureId::default());
+        no_indices.vertices = vec![vertex; 3];
+
+        let mut out_of_range = Mesh::with_texture(TextureId::default());
+        out_of_range.vertices = vec![vertex];
+        out_of_range.indices = vec![0, 1, 2];
+
+        let foreign_callback = Primitive::Callback(PaintCallback {
+            rect: rect(0.0, 0.0, 4.0, 4.0),
+            callback: Arc::new(0_u8),
+        });
+
+        let rgba = paint(
+            4,
+            4,
+            vec![
+                Primitive::Mesh(unknown_texture),
+                Primitive::Mesh(no_indices),
+                Primitive::Mesh(out_of_range),
+                foreign_callback,
+            ],
+            delta,
+        );
+        assert!(rgba.iter().all(|&byte| byte == 0));
+    }
+}
